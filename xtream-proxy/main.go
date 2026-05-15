@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -36,6 +37,15 @@ const (
 	xmltvfrURL   = "https://xmltvfr.fr/xmltv/xmltv_fr.xml.gz"
 	epgRefresh   = 8 * time.Hour
 )
+
+// Android n'expose pas son store CA aux binaires Linux non-system.
+// xmltvfr.fr utilise HTTPS — on skip la vérification TLS pour cette source EPG.
+var insecureClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
+	Timeout: 10 * time.Minute,
+}
 
 // ── JSON API cache ────────────────────────────────────────────────────────────
 
@@ -338,6 +348,16 @@ func refreshEPG() error {
 	}
 	defer resp.Body.Close()
 
+	log.Printf("EPG: iptvhunt status=%d content-type=%q content-encoding=%q size=%s",
+		resp.StatusCode,
+		resp.Header.Get("Content-Type"),
+		resp.Header.Get("Content-Encoding"),
+		resp.Header.Get("Content-Length"))
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("iptvhunt EPG status %d", resp.StatusCode)
+	}
+
 	epgReader := io.Reader(resp.Body)
 	if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
 		gr, err := gzip.NewReader(resp.Body)
@@ -351,6 +371,10 @@ func refreshEPG() error {
 	foundIDs := filterXMLTV(epgReader, wantedIDs, enc)
 	log.Printf("EPG: %d/%d chaînes trouvées dans iptvhunt", len(foundIDs), len(wantedIDs))
 
+	if len(foundIDs) == 0 {
+		return fmt.Errorf("iptvhunt EPG a retourné 0 chaînes (rate-limit ou erreur serveur) — cache conservé")
+	}
+
 	// 2b. Source complémentaire : xmltv.fr pour les chaînes manquantes
 	missingIDs := make(map[string]bool)
 	for id := range wantedIDs {
@@ -361,7 +385,7 @@ func refreshEPG() error {
 
 	if len(missingIDs) > 0 {
 		log.Printf("EPG: %d chaînes manquantes, fetch xmltvfr", len(missingIDs))
-		resp2, err := http.Get(xmltvfrURL)
+		resp2, err := insecureClient.Get(xmltvfrURL)
 		if err != nil {
 			log.Printf("EPG: xmltvfr fetch error: %v", err)
 		} else {
