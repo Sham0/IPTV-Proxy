@@ -34,6 +34,7 @@ const (
 	proxyHost    = "192.168.0.25"
 	cacheTTL     = 4 * time.Hour
 	epgCachePath = "/sdcard/m3u-proxy-backup/epg-cache.xml.gz"
+	credsPath    = "/sdcard/m3u-proxy-backup/creds.txt"
 	xmltvfrURL   = "https://xmltvfr.fr/xmltv/xmltv_fr.xml.gz"
 	epgRefresh   = 8 * time.Hour
 )
@@ -91,6 +92,23 @@ var (
 	credsReady = make(chan struct{})
 )
 
+func loadCredsFromDisk() {
+	data, err := os.ReadFile(credsPath)
+	if err != nil {
+		return
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return
+	}
+	credsOnce.Do(func() {
+		epgUser = parts[0]
+		epgPass = parts[1]
+		close(credsReady)
+		log.Printf("EPG: credentials chargés depuis disque")
+	})
+}
+
 func captureCredentials(r *http.Request) {
 	u := r.URL.Query().Get("username")
 	p := r.URL.Query().Get("password")
@@ -101,6 +119,7 @@ func captureCredentials(r *http.Request) {
 		epgUser = u
 		epgPass = p
 		close(credsReady)
+		os.WriteFile(credsPath, []byte(u+"\n"+p+"\n"), 0600)
 	})
 }
 
@@ -656,6 +675,7 @@ func main() {
 	log.SetOutput(lf)
 	log.Printf("xtream-proxy starting on :%s", listenPort)
 
+	loadCredsFromDisk()
 	loadEPGFromDisk()
 	go epgFetcher()
 
