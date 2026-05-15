@@ -223,6 +223,80 @@ func patchServerInfo(data json.RawMessage) json.RawMessage {
 	return r
 }
 
+// ── Inférence epg_channel_id ──────────────────────────────────────────────────
+
+var epgSuffixes = []string{
+	" ᴿᴬᵂ", " ⁶⁰ᶠᵖˢ", " ᴴᴰ", " ᵁᴴᴰ",
+	" 4K", " UHD", " FHD", " HD", " LQ", " SD",
+	" +1", " +24", " +6H",
+}
+
+// normalizeStreamName retire le préfixe catégorie ("FR| ", "BE| "…)
+// et les suffixes qualité ("HD", "FHD", "ᴿᴬᵂ"…) pour obtenir un nom canonique.
+func normalizeStreamName(name string) string {
+	if i := strings.LastIndex(name, "| "); i >= 0 {
+		name = name[i+2:]
+	}
+	for {
+		trimmed := strings.TrimSpace(name)
+		upper := strings.ToUpper(trimmed)
+		changed := false
+		for _, s := range epgSuffixes {
+			if strings.HasSuffix(upper, strings.ToUpper(s)) {
+				name = trimmed[:len(trimmed)-len(s)]
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	// Supprime les espaces pour unifier "TV5MONDE" et "TV5 MONDE", "CINE+CLASSIC" et "CINE+ CLASSIC"
+	return strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(name)), " ", "")
+}
+
+// inferMissingEpgIDs comble les epg_channel_id vides en cherchant
+// une variante du même nom qui dispose déjà d'un ID valide.
+func inferMissingEpgIDs(data json.RawMessage) json.RawMessage {
+	var streams []map[string]interface{}
+	if json.Unmarshal(data, &streams) != nil {
+		return data
+	}
+
+	nameToID := make(map[string]string)
+	for _, s := range streams {
+		id := fmt.Sprintf("%v", s["epg_channel_id"])
+		if id == "" || id == "<nil>" || id == "null" {
+			continue
+		}
+		name := normalizeStreamName(fmt.Sprintf("%v", s["name"]))
+		if name != "" {
+			if _, exists := nameToID[name]; !exists {
+				nameToID[name] = id
+			}
+		}
+	}
+
+	changed := false
+	for _, s := range streams {
+		id := fmt.Sprintf("%v", s["epg_channel_id"])
+		if id != "" && id != "<nil>" && id != "null" {
+			continue
+		}
+		name := normalizeStreamName(fmt.Sprintf("%v", s["name"]))
+		if inferred, ok := nameToID[name]; ok {
+			s["epg_channel_id"] = inferred
+			changed = true
+		}
+	}
+	if !changed {
+		return data
+	}
+	r, _ := json.Marshal(streams)
+	return r
+}
+
 func catURL(r *http.Request, action string) string {
 	u := r.URL.Query()
 	return fmt.Sprintf("%s/player_api.php?username=%s&password=%s&action=%s",
@@ -247,6 +321,11 @@ func copyXMLElement(dec *xml.Decoder, enc *xml.Encoder, start xml.StartElement) 
 	for depth > 0 {
 		tok, err := dec.Token()
 		if err != nil {
+			// Ferme les éléments ouverts pour ne pas corrompre l'encodeur
+			for depth > 0 {
+				enc.EncodeToken(xml.EndElement{Name: start.Name})
+				depth--
+			}
 			return
 		}
 		enc.EncodeToken(tok)
@@ -266,11 +345,15 @@ func filterXMLTV(r io.Reader, wanted map[string]bool, enc *xml.Encoder) map[stri
 	found := make(map[string]bool)
 	dec := xml.NewDecoder(r)
 	dec.Strict = false
+	dec.Entity = xml.HTMLEntity // gère &eacute; &agrave; &nbsp; etc. dans les EPG
 
 	for {
 		tok, err := dec.Token()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			continue // entité inconnue ou token corrompu : on passe au suivant
 		}
 		start, ok := tok.(xml.StartElement)
 		if !ok {
@@ -482,7 +565,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 502)
 			return
 		}
-		w.Write(filterStreams(d, keptIDs(cats, keepLive)))
+		w.Write(inferMissingEpgIDs(filterStreams(d, keptIDs(cats, keepLive))))
 
 	case "get_vod_categories":
 		d, err := cachedJSON(upURL)
