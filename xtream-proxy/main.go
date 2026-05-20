@@ -39,13 +39,18 @@ const (
 	epgRefresh   = 8 * time.Hour
 )
 
+// Client avec timeout pour les appels upstream (Xtream API + EPG).
+// Sans timeout, http.Get peut bloquer indéfiniment si le serveur accroche,
+// ce qui tue silencieusement la goroutine epgFetcher.
+var httpClient = &http.Client{Timeout: 5 * time.Minute}
+
 // Android n'expose pas son store CA aux binaires Linux non-system.
 // xmltvfr.fr utilise HTTPS — on skip la vérification TLS pour cette source EPG.
 var insecureClient = &http.Client{
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	},
-	Timeout: 10 * time.Minute,
+	Timeout: 5 * time.Minute,
 }
 
 // ── JSON API cache ────────────────────────────────────────────────────────────
@@ -138,8 +143,7 @@ func loadEPGFromDisk() {
 
 func keepLive(name string) bool {
 	return strings.HasPrefix(name, "FR|") ||
-		strings.HasPrefix(name, "24/7") ||
-		strings.HasPrefix(name, "4K") ||
+		(strings.HasPrefix(name, "4K") && name != "4K UHD 3840P") ||
 		name == "CA| FRENCH" ||
 		name == "BE| WALLONIË" ||
 		name == "EU| LUXEMBOURG"
@@ -155,7 +159,7 @@ func keepVod(name string) bool {
 }
 
 func fetchJSON(url string) (json.RawMessage, error) {
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +448,7 @@ func refreshEPG() error {
 
 	// 2a. Source principale : iptvhunt
 	epgURL := fmt.Sprintf("%s/xmltv.php?username=%s&password=%s", upstream, epgUser, epgPass)
-	resp, err := http.Get(epgURL)
+	resp, err := httpClient.Get(epgURL)
 	if err != nil {
 		return fmt.Errorf("fetch iptvhunt EPG: %w", err)
 	}
@@ -523,6 +527,17 @@ func refreshEPG() error {
 	return nil
 }
 
+func safeRefreshEPG() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("EPG: panic dans refreshEPG: %v", r)
+		}
+	}()
+	if err := refreshEPG(); err != nil {
+		log.Printf("EPG: refresh échoué: %v", err)
+	}
+}
+
 func epgFetcher() {
 	// Attend les credentials (première requête IPTV Smarters)
 	<-credsReady
@@ -532,18 +547,20 @@ func epgFetcher() {
 	info, err := os.Stat(epgCachePath)
 	if err != nil || time.Since(info.ModTime()) > epgRefresh {
 		time.Sleep(10 * time.Second) // laisse le système se stabiliser
-		if err := refreshEPG(); err != nil {
-			log.Printf("EPG: refresh initial échoué: %v", err)
-		}
+		safeRefreshEPG()
 	} else {
 		log.Printf("EPG: cache disque récent (%.1fh), pas de refresh immédiat",
 			time.Since(info.ModTime()).Hours())
 	}
 
-	for {
-		time.Sleep(epgRefresh)
-		if err := refreshEPG(); err != nil {
-			log.Printf("EPG: refresh périodique échoué: %v", err)
+	// Tick toutes les minutes : résistant au Doze mode Android qui peut geler
+	// un time.Sleep(8h) indéfiniment. On décide du refresh selon l'âge du cache.
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		info, err := os.Stat(epgCachePath)
+		if err != nil || time.Since(info.ModTime()) >= epgRefresh {
+			safeRefreshEPG()
 		}
 	}
 }
