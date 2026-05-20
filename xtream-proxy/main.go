@@ -543,18 +543,18 @@ func epgFetcher() {
 	<-credsReady
 	log.Printf("EPG: credentials capturés, vérification du cache")
 
-	// Refresh immédiat si le cache disque est absent ou trop vieux
 	info, err := os.Stat(epgCachePath)
-	if err != nil || time.Since(info.ModTime()) > epgRefresh {
-		time.Sleep(10 * time.Second) // laisse le système se stabiliser
-		safeRefreshEPG()
+	if err != nil {
+		log.Printf("EPG: pas de cache disque, refresh au prochain tick")
 	} else {
-		log.Printf("EPG: cache disque récent (%.1fh), pas de refresh immédiat",
+		log.Printf("EPG: cache disque %.1fh, refresh au prochain tick si >= 8h",
 			time.Since(info.ModTime()).Hours())
 	}
 
 	// Tick toutes les minutes : résistant au Doze mode Android qui peut geler
 	// un time.Sleep(8h) indéfiniment. On décide du refresh selon l'âge du cache.
+	// Pas de refresh immédiat au boot : le réseau n'est pas encore monté à t+10s.
+	// Le vieil EPG chargé depuis disque est servi en attendant.
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
