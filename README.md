@@ -3,6 +3,8 @@
 Proxy Xtream Codes API tournant sur un Freebox Player (Android TV, 192.168.0.25).  
 Filtre le catalogue du provider IPTV pour ne garder que les contenus FR/MULTI, cache l'EPG localement et l'expose via les mêmes endpoints que le provider.
 
+**Version actuelle : v5h (2026-05-20)**
+
 ---
 
 ## Architecture
@@ -43,7 +45,7 @@ Cache JSON en mémoire : TTL 4h (évite de re-fetcher le catalogue à chaque req
 
 ```go
 // Live : préfixes de catégorie
-keepLive: "FR|", "24/7", "4K", "CA| FRENCH", "BE| WALLONIË", "EU| LUXEMBOURG"
+keepLive: "FR|", "4K" (sauf "4K UHD 3840P"), "CA| FRENCH", "BE| WALLONIË", "EU| LUXEMBOURG"
 
 // VOD + Séries : préfixes de catégorie
 keepVod: "|FR|", "|QC|", "|MULTI|", "4K", contient "NETFLIX", contient "APPLE+"
@@ -81,19 +83,22 @@ APK minimaliste qui maintient le proxy vivant après le boot.
 ### Stratégie cache (dans `libxtreamproxy.so`)
 
 - Au démarrage : charge `/sdcard/m3u-proxy-backup/epg-cache.xml.gz` en mémoire → `/xmltv.php` répond instantanément
-- Goroutine EPG (toutes les 8h) :
+- Goroutine EPG (refresh toutes les 8h) :
   1. Récupère la liste des `epg_channel_id` des streams live filtrés
   2. Télécharge l'EPG iptvhunt complet, filtre en streaming XML (garde seulement les chaînes du Set)
   3. Merge avec xmltvfr.fr pour les chaînes manquantes
   4. Compresse → écrit disque + swap mémoire atomique
+- Scheduler : `time.NewTicker(1min)` vérifie l'âge du cache — résistant au Doze mode Android (un `time.Sleep(8h)` peut être gelé indéfiniment)
 - Fallback si cache vide au 1er boot → redirect transparent vers upstream
 
-**Gain :** ~50 000 chaînes iptvhunt → ~300 chaînes FR. Fichier : ~100 MB brut → ~3 MB gzippé.
+**Gain :** ~50 000 chaînes iptvhunt → ~265 chaînes FR. Fichier : ~100 MB brut → ~1.1 MB gzippé.
 
-### IDs EPG
+**Couverture EPG :** 256/265 chaînes FR. Les 9 sans EPG sont des chaînes belges néerlandophones (Bruzz, Q-music, Sport10…) absentes de toutes les sources.
 
-Les `epg_channel_id` des streams utilisent le format `Name.fr` (ex : `TF1.fr`, `France2.fr`, `Action.fr`).  
-C'est le même format qu'iptvhunt et xmltvfr.fr — pas de mapping nécessaire.
+### inferMissingEpgIDs
+
+Propage l'`epg_channel_id` aux variantes sans ID en cherchant une variante sœur (HD → FHD, LQ, RAW…) via normalisation du nom (strip préfixe catégorie + suffixes qualité).  
+Ex : `OCS FHD`, `TV5MONDE FHD`, `NRJ12 FHD`, `CINE+CLASSIC` récupèrent l'ID de leur variante HD.
 
 ---
 
@@ -116,26 +121,32 @@ GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
 ### Mettre à jour l'APK
 
 ```bash
-# Décompiler
-apktool d android/m3ubootstart_v4_clean.apk -o /tmp/m3ubootstart_decompiled -f
+# Récupérer l'APK courant depuis la SD (si /tmp/m3ubootstart_epg absent — non persistant)
+adb connect 192.168.0.25:5555
+adb pull /sdcard/m3u-proxy-backup/m3ubootstart_v5h_epg.apk /tmp/
+apktool d /tmp/m3ubootstart_v5h_epg.apk -o /tmp/m3ubootstart_epg --force
 
 # Remplacer le binaire
-cp xtream-proxy/libxtreamproxy.so /tmp/m3ubootstart_decompiled/lib/armeabi-v7a/
+cp xtream-proxy/libxtreamproxy.so /tmp/m3ubootstart_epg/lib/armeabi-v7a/
 
 # Recompiler + signer (keystore sur la SD ou ~/m3u-proxy-backup/v3-xtream/)
-apktool b /tmp/m3ubootstart_decompiled -o /tmp/m3ubootstart_unsigned.apk
+apktool b /tmp/m3ubootstart_epg -o /tmp/m3ubootstart_unsigned.apk
 zipalign -v 4 /tmp/m3ubootstart_unsigned.apk /tmp/m3ubootstart_aligned.apk
 apksigner sign \
-  --ks m3u-sign.keystore --ks-key-alias m3u \
+  --ks ~/m3u-proxy-backup/v3-xtream/m3u-sign.keystore --ks-key-alias m3u \
   --ks-pass pass:android --key-pass pass:android \
   --out m3ubootstart_new.apk /tmp/m3ubootstart_aligned.apk
 
 # Déployer (même keystore = -r, pas besoin de désinstaller)
-adb connect 192.168.0.25:5555
 adb push m3ubootstart_new.apk /data/local/tmp/m3ubootstart.apk
 adb shell 'settings put global package_verifier_enable 0 \
   && pm install -r /data/local/tmp/m3ubootstart.apk \
   && settings put global package_verifier_enable 1'
+adb shell 'am force-stop fr.shamo.m3ubootstart \
+  && am start-foreground-service --include-stopped-packages -n fr.shamo.m3ubootstart/.ProxyService'
+
+# Sauvegarder l'APK sur la SD
+adb push m3ubootstart_new.apk /sdcard/m3u-proxy-backup/m3ubootstart_v5X_epg.apk
 ```
 
 ### Keystore
@@ -152,16 +163,18 @@ adb shell 'settings put global package_verifier_enable 0 \
 ```bash
 # Ports actifs
 adb shell 'netstat -tln | grep ":::888"'
-# Attendu : 8889
+# Attendu : 8889 uniquement
 
 # Process
 adb shell 'ps -A | grep shamo'
 
-# Logs
-adb shell 'tail -20 /sdcard/xtream-proxy.log'
+# Logs EPG (derniers refreshs)
+adb shell 'grep EPG /sdcard/xtream-proxy.log | tail -10'
 
-# Forcer redémarrage du service
-adb shell 'am start-foreground-service --include-stopped-packages -n fr.shamo.m3ubootstart/.ProxyService'
+# Forcer refresh EPG hors cycle (supprime le cache → refresh au redémarrage)
+adb shell 'rm /sdcard/m3u-proxy-backup/epg-cache.xml.gz \
+  && am force-stop fr.shamo.m3ubootstart \
+  && am start-foreground-service --include-stopped-packages -n fr.shamo.m3ubootstart/.ProxyService'
 ```
 
 ---
