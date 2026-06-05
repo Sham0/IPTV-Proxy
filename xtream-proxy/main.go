@@ -167,6 +167,16 @@ func fetchJSON(url string) (json.RawMessage, error) {
 	return io.ReadAll(resp.Body)
 }
 
+func fetchJSONCtx(ctx context.Context, url string) (json.RawMessage, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
 func cachedJSON(url string) (json.RawMessage, error) {
 	if d, ok := cache.get(url); ok {
 		return d, nil
@@ -407,7 +417,7 @@ func filterXMLTV(r io.Reader, wanted map[string]bool, enc *xml.Encoder) map[stri
 
 // ── Refresh EPG ───────────────────────────────────────────────────────────────
 
-func refreshEPG() error {
+func refreshEPG(ctx context.Context) error {
 	log.Printf("EPG: début du refresh")
 
 	// 1. Récupère les streams live filtrés → liste des epg_channel_id voulus
@@ -416,11 +426,11 @@ func refreshEPG() error {
 	streamsURL := fmt.Sprintf("%s/player_api.php?username=%s&password=%s&action=get_live_streams",
 		upstream, epgUser, epgPass)
 
-	catsData, err := fetchJSON(catsURL)
+	catsData, err := fetchJSONCtx(ctx, catsURL)
 	if err != nil {
 		return fmt.Errorf("fetch categories: %w", err)
 	}
-	streamsData, err := fetchJSON(streamsURL)
+	streamsData, err := fetchJSONCtx(ctx, streamsURL)
 	if err != nil {
 		return fmt.Errorf("fetch streams: %w", err)
 	}
@@ -448,7 +458,8 @@ func refreshEPG() error {
 
 	// 2a. Source principale : iptvhunt
 	epgURL := fmt.Sprintf("%s/xmltv.php?username=%s&password=%s", upstream, epgUser, epgPass)
-	resp, err := httpClient.Get(epgURL)
+	epgReq, _ := http.NewRequestWithContext(ctx, "GET", epgURL, nil)
+	resp, err := httpClient.Do(epgReq)
 	if err != nil {
 		return fmt.Errorf("fetch iptvhunt EPG: %w", err)
 	}
@@ -491,7 +502,8 @@ func refreshEPG() error {
 
 	if len(missingIDs) > 0 {
 		log.Printf("EPG: %d chaînes manquantes, fetch xmltvfr", len(missingIDs))
-		resp2, err := insecureClient.Get(xmltvfrURL)
+		req2, _ := http.NewRequestWithContext(ctx, "GET", xmltvfrURL, nil)
+		resp2, err := insecureClient.Do(req2)
 		if err != nil {
 			log.Printf("EPG: xmltvfr fetch error: %v", err)
 		} else {
@@ -527,13 +539,13 @@ func refreshEPG() error {
 	return nil
 }
 
-func safeRefreshEPG() {
+func safeRefreshEPGCtx(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("EPG: panic dans refreshEPG: %v", r)
 		}
 	}()
-	if err := refreshEPG(); err != nil {
+	if err := refreshEPG(ctx); err != nil {
 		log.Printf("EPG: refresh échoué: %v", err)
 	}
 }
@@ -553,14 +565,50 @@ func epgFetcher() {
 
 	// Tick toutes les minutes : résistant au Doze mode Android qui peut geler
 	// un time.Sleep(8h) indéfiniment. On décide du refresh selon l'âge du cache.
-	// Pas de refresh immédiat au boot : le réseau n'est pas encore monté à t+10s.
-	// Le vieil EPG chargé depuis disque est servi en attendant.
+	// Le refresh tourne dans une goroutine dédiée pour ne pas bloquer le ticker.
+	// Si la goroutine accroche >10min (Doze peut geler les timers HTTP internes),
+	// le ticker annule son contexte et en relance une nouvelle à la prochaine occasion.
+	const maxRefreshDuration = 10 * time.Minute
+
+	var (
+		mu            sync.Mutex
+		refreshCancel context.CancelFunc
+		refreshStart  time.Time
+	)
+
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
+		mu.Lock()
+		if refreshCancel != nil && time.Since(refreshStart) > maxRefreshDuration {
+			log.Printf("EPG: refresh bloqué depuis >10min, annulation")
+			refreshCancel()
+			refreshCancel = nil
+		}
+		running := refreshCancel != nil
+		mu.Unlock()
+
+		if running {
+			continue
+		}
+
 		info, err := os.Stat(epgCachePath)
 		if err != nil || time.Since(info.ModTime()) >= epgRefresh {
-			safeRefreshEPG()
+			ctx, cancel := context.WithCancel(context.Background())
+			mu.Lock()
+			refreshCancel = cancel
+			refreshStart = time.Now()
+			mu.Unlock()
+
+			go func(ctx context.Context, cancel context.CancelFunc) {
+				defer func() {
+					cancel()
+					mu.Lock()
+					refreshCancel = nil
+					mu.Unlock()
+				}()
+				safeRefreshEPGCtx(ctx)
+			}(ctx, cancel)
 		}
 	}
 }

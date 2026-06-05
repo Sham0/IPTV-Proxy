@@ -3,7 +3,7 @@
 Proxy Xtream Codes API tournant sur un Freebox Player (Android TV, 192.168.0.25).  
 Filtre le catalogue du provider IPTV pour ne garder que les contenus FR/MULTI, cache l'EPG localement et l'expose via les mêmes endpoints que le provider.
 
-**Version actuelle : v5i (2026-05-20)**
+**Version actuelle : v5j (2026-06-05)**
 
 ---
 
@@ -83,13 +83,14 @@ APK minimaliste qui maintient le proxy vivant après le boot.
 ### Stratégie cache (dans `libxtreamproxy.so`)
 
 - Au démarrage : charge `/sdcard/m3u-proxy-backup/epg-cache.xml.gz` en mémoire → `/xmltv.php` répond instantanément
-- Goroutine EPG (refresh toutes les 8h) :
+- Ticker 1 minute (résistant au Doze) : déclenche un refresh si cache > 8h
+- Refresh dans une goroutine dédiée avec context annulable :
   1. Récupère la liste des `epg_channel_id` des streams live filtrés
   2. Télécharge l'EPG iptvhunt complet, filtre en streaming XML (garde seulement les chaînes du Set)
   3. Merge avec xmltvfr.fr pour les chaînes manquantes
   4. Compresse → écrit disque + swap mémoire atomique
-- Scheduler : `time.NewTicker(1min)` vérifie l'âge du cache — résistant au Doze mode Android (un `time.Sleep(8h)` peut être gelé indéfiniment)
-- Pas de refresh immédiat au boot : le réseau n'est pas encore monté à t+10s. Le ticker prend en charge tout le cycle depuis le démarrage ; le vieil EPG disque est servi en attendant.
+- Si la goroutine ne termine pas en 10 min, le ticker annule son contexte (le Doze peut geler les timers HTTP internes — la goroutine dédiée évite de bloquer le ticker)
+- Pas de refresh immédiat au boot : le réseau n'est pas encore monté à t+10s. Le vieil EPG disque est servi en attendant.
 - Fallback si cache vide au 1er boot → redirect transparent vers upstream
 
 **Gain :** ~50 000 chaînes iptvhunt → ~265 chaînes FR. Fichier : ~100 MB brut → ~1.1 MB gzippé.
@@ -122,10 +123,10 @@ GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
 ### Mettre à jour l'APK
 
 ```bash
-# Récupérer l'APK courant depuis la SD (si /tmp/m3ubootstart_epg absent — non persistant)
+# Récupérer le dernier APK depuis la SD (/tmp n'est pas persistant)
 adb connect 192.168.0.25:5555
-adb pull /sdcard/m3u-proxy-backup/m3ubootstart_v5i_epg.apk /tmp/
-apktool d /tmp/m3ubootstart_v5i_epg.apk -o /tmp/m3ubootstart_epg --force
+adb shell 'cat /sdcard/m3u-proxy-backup/m3ubootstart_v5j_epg.apk' > /tmp/m3ubootstart_v5j_epg.apk
+apktool d /tmp/m3ubootstart_v5j_epg.apk -o /tmp/m3ubootstart_epg --force
 
 # Remplacer le binaire
 cp xtream-proxy/libxtreamproxy.so /tmp/m3ubootstart_epg/lib/armeabi-v7a/
