@@ -550,8 +550,57 @@ func safeRefreshEPGCtx(ctx context.Context) {
 	}
 }
 
+// ── Refresh EPG déclenché par ticker et par requête ───────────────────────────
+// refreshMu protège refreshCancel/refreshStart, accessibles depuis le ticker
+// ET depuis handleXMLTV (déclenchement sur requête, fallback si Doze gèle le ticker).
+var (
+	refreshMu     sync.Mutex
+	refreshCancel context.CancelFunc
+	refreshStart  time.Time
+)
+
+const maxRefreshDuration = 10 * time.Minute
+
+// tryStartRefresh démarre un refresh EPG en arrière-plan si le cache est périmé
+// et qu'aucun refresh n'est déjà en cours. No-op si les credentials ne sont pas prêts.
+func tryStartRefresh() {
+	select {
+	case <-credsReady:
+	default:
+		return
+	}
+
+	refreshMu.Lock()
+	if refreshCancel != nil && time.Since(refreshStart) > maxRefreshDuration {
+		log.Printf("EPG: refresh bloqué depuis >10min, annulation")
+		refreshCancel()
+		refreshCancel = nil
+	}
+	if refreshCancel != nil {
+		refreshMu.Unlock()
+		return
+	}
+	info, err := os.Stat(epgCachePath)
+	if err != nil || time.Since(info.ModTime()) >= epgRefresh {
+		ctx, cancel := context.WithCancel(context.Background())
+		refreshCancel = cancel
+		refreshStart = time.Now()
+		refreshMu.Unlock()
+		go func() {
+			defer func() {
+				cancel()
+				refreshMu.Lock()
+				refreshCancel = nil
+				refreshMu.Unlock()
+			}()
+			safeRefreshEPGCtx(ctx)
+		}()
+	} else {
+		refreshMu.Unlock()
+	}
+}
+
 func epgFetcher() {
-	// Attend les credentials (première requête IPTV Smarters)
 	<-credsReady
 	log.Printf("EPG: credentials capturés, vérification du cache")
 
@@ -563,53 +612,10 @@ func epgFetcher() {
 			time.Since(info.ModTime()).Hours())
 	}
 
-	// Tick toutes les minutes : résistant au Doze mode Android qui peut geler
-	// un time.Sleep(8h) indéfiniment. On décide du refresh selon l'âge du cache.
-	// Le refresh tourne dans une goroutine dédiée pour ne pas bloquer le ticker.
-	// Si la goroutine accroche >10min (Doze peut geler les timers HTTP internes),
-	// le ticker annule son contexte et en relance une nouvelle à la prochaine occasion.
-	const maxRefreshDuration = 10 * time.Minute
-
-	var (
-		mu            sync.Mutex
-		refreshCancel context.CancelFunc
-		refreshStart  time.Time
-	)
-
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		mu.Lock()
-		if refreshCancel != nil && time.Since(refreshStart) > maxRefreshDuration {
-			log.Printf("EPG: refresh bloqué depuis >10min, annulation")
-			refreshCancel()
-			refreshCancel = nil
-		}
-		running := refreshCancel != nil
-		mu.Unlock()
-
-		if running {
-			continue
-		}
-
-		info, err := os.Stat(epgCachePath)
-		if err != nil || time.Since(info.ModTime()) >= epgRefresh {
-			ctx, cancel := context.WithCancel(context.Background())
-			mu.Lock()
-			refreshCancel = cancel
-			refreshStart = time.Now()
-			mu.Unlock()
-
-			go func(ctx context.Context, cancel context.CancelFunc) {
-				defer func() {
-					cancel()
-					mu.Lock()
-					refreshCancel = nil
-					mu.Unlock()
-				}()
-				safeRefreshEPGCtx(ctx)
-			}(ctx, cancel)
-		}
+		tryStartRefresh()
 	}
 }
 
@@ -617,6 +623,7 @@ func epgFetcher() {
 
 func handleAPI(w http.ResponseWriter, r *http.Request) {
 	captureCredentials(r)
+	tryStartRefresh()
 	action := r.URL.Query().Get("action")
 	upURL := upstream + r.URL.RequestURI()
 	w.Header().Set("Content-Type", "application/json")
@@ -712,6 +719,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 
 func handleXMLTV(w http.ResponseWriter, r *http.Request) {
 	captureCredentials(r)
+	tryStartRefresh() // déclenche un refresh si cache périmé, même si le ticker est gelé par Doze
 
 	epgMu.RLock()
 	data := epgData
