@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -18,23 +17,13 @@ import (
 	"time"
 )
 
-func init() {
-	// Android ne fournit pas /etc/resolv.conf aux binaires Linux — DNS forcé sur la box
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "udp", "192.168.0.254:53")
-		},
-	}
-}
-
 const (
 	upstream     = "http://line.iptvhunt.com"
 	listenPort   = "8889"
-	proxyHost    = "192.168.0.25"
+	proxyHost    = "192.168.0.11"
 	cacheTTL     = 4 * time.Hour
-	epgCachePath = "/sdcard/m3u-proxy-backup/epg-cache.xml.gz"
-	credsPath    = "/sdcard/m3u-proxy-backup/creds.txt"
+	epgCachePath = "/storage/proxy/epg-cache.xml.gz"
+	credsPath    = "/storage/proxy/creds.txt"
 	xmltvfrURL   = "https://xmltvfr.fr/xmltv/xmltv_fr.xml.gz"
 	epgRefresh   = 8 * time.Hour
 )
@@ -142,18 +131,12 @@ func loadEPGFromDisk() {
 // ── Filtrage catégories / streams ─────────────────────────────────────────────
 
 func keepLive(name string) bool {
-	return strings.HasPrefix(name, "FR|") ||
-		(strings.HasPrefix(name, "4K") && name != "4K UHD 3840P") ||
-		name == "CA| FRENCH" ||
-		name == "BE| WALLONIË" ||
-		name == "EU| LUXEMBOURG"
+	return strings.HasPrefix(name, "FR|")
 }
 
 func keepVod(name string) bool {
 	return strings.HasPrefix(name, "|FR|") ||
-		strings.HasPrefix(name, "|QC|") ||
 		strings.HasPrefix(name, "|MULTI|") ||
-		strings.HasPrefix(name, "4K") ||
 		strings.Contains(name, "NETFLIX") ||
 		strings.Contains(name, "APPLE+")
 }
@@ -744,7 +727,8 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	lf, _ := os.OpenFile("/sdcard/xtream-proxy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	os.MkdirAll("/storage/proxy", 0755)
+	lf, _ := os.OpenFile("/storage/proxy/proxy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	log.SetOutput(lf)
 	log.Printf("xtream-proxy starting on :%s", listenPort)
 
