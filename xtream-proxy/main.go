@@ -135,6 +135,29 @@ func keepLive(name string) bool {
 		strings.HasPrefix(name, "CDM|")
 }
 
+// cleanVodName strips provider prefixes ("FR - ", "MULTI - ", etc.) and trailing
+// year suffixes already embedded in the name so TMDB gets a clean title to match.
+func cleanVodName(name string) string {
+	if i := strings.Index(name, " - "); i >= 0 && i <= 8 {
+		name = strings.TrimSpace(name[i+3:])
+	}
+	return name
+}
+
+func cleanVodNames(data json.RawMessage) json.RawMessage {
+	var streams []map[string]interface{}
+	if json.Unmarshal(data, &streams) != nil {
+		return data
+	}
+	for _, s := range streams {
+		if n, ok := s["name"].(string); ok {
+			s["name"] = cleanVodName(n)
+		}
+	}
+	r, _ := json.Marshal(streams)
+	return r
+}
+
 func keepVod(name string) bool {
 	return strings.HasPrefix(name, "|FR|") ||
 		strings.HasPrefix(name, "|MULTI|") ||
@@ -661,7 +684,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 502)
 			return
 		}
-		w.Write(filterStreams(d, keptIDs(cats, keepVod)))
+		w.Write(cleanVodNames(filterStreams(d, keptIDs(cats, keepVod))))
 
 	case "get_series_categories":
 		d, err := cachedJSON(upURL)
@@ -682,7 +705,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 502)
 			return
 		}
-		w.Write(filterStreams(d, keptIDs(cats, keepVod)))
+		w.Write(cleanVodNames(filterStreams(d, keptIDs(cats, keepVod))))
 
 	default:
 		resp, err := http.Get(upURL)
