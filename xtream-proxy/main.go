@@ -19,14 +19,17 @@ import (
 )
 
 const (
-	upstream     = "http://line.iptvhunt.com"
-	listenPort   = "8889"
-	proxyHost    = "192.168.0.11"
-	cacheTTL     = 4 * time.Hour
-	epgCachePath = "/storage/proxy/epg-cache.xml.gz"
-	credsPath    = "/storage/proxy/creds.txt"
-	xmltvfrURL   = "https://xmltvfr.fr/xmltv/xmltv_fr.xml.gz"
-	epgRefresh   = 8 * time.Hour
+	upstream        = "http://line.iptvhunt.com"
+	listenPort      = "8889"
+	proxyHost       = "192.168.0.11"
+	cacheTTL        = 4 * time.Hour
+	epgCachePath    = "/storage/proxy/epg-cache.xml.gz"
+	credsPath       = "/storage/proxy/creds.txt"
+	xmltvfrURL      = "https://xmltvfr.fr/xmltv/xmltv_fr.xml.gz"
+	epgRefresh      = 8 * time.Hour
+	codecCachePath  = "/storage/proxy/codec_cache.json"
+	codecScanDelay  = 200 * time.Millisecond
+	codecSavePeriod = 100
 )
 
 // Client avec timeout pour les appels upstream (Xtream API + EPG).
@@ -74,6 +77,164 @@ func (c *apiCache) set(key string, data json.RawMessage) {
 }
 
 var cache = newCache()
+
+// ── Codec cache ───────────────────────────────────────────────────────────────
+
+var blockedCodecs = map[string]bool{"hevc": true, "h265": true, "av1": true, "vp9": true}
+
+type codecStore struct {
+	sync.RWMutex
+	data map[string]string // stream_id → codec_name
+}
+
+var codecDB = &codecStore{data: make(map[string]string)}
+
+func loadCodecCache() {
+	b, err := os.ReadFile(codecCachePath)
+	if err != nil {
+		return
+	}
+	codecDB.Lock()
+	json.Unmarshal(b, &codecDB.data)
+	codecDB.Unlock()
+	log.Printf("Codec cache: %d entrées chargées", len(codecDB.data))
+}
+
+func saveCodecCache() {
+	codecDB.RLock()
+	b, _ := json.Marshal(codecDB.data)
+	codecDB.RUnlock()
+	os.WriteFile(codecCachePath, b, 0644)
+}
+
+func filterHevc(data json.RawMessage) json.RawMessage {
+	var streams []map[string]interface{}
+	if json.Unmarshal(data, &streams) != nil {
+		return data
+	}
+	var out []map[string]interface{}
+	skipped := 0
+	codecDB.RLock()
+	for _, s := range streams {
+		sid := fmt.Sprintf("%v", s["stream_id"])
+		if codec, known := codecDB.data[sid]; known && blockedCodecs[codec] {
+			skipped++
+			continue
+		}
+		out = append(out, s)
+	}
+	codecDB.RUnlock()
+	if skipped > 0 {
+		log.Printf("filterHevc: %d streams HEVC masqués", skipped)
+	}
+	r, _ := json.Marshal(out)
+	return r
+}
+
+func extractCodec(raw json.RawMessage) string {
+	var resp struct {
+		Info struct {
+			Video json.RawMessage `json:"video"`
+		} `json:"info"`
+	}
+	if json.Unmarshal(raw, &resp) != nil || resp.Info.Video == nil {
+		return ""
+	}
+	// Upstream renvoie parfois un objet, parfois un tableau
+	var obj struct {
+		CodecName string `json:"codec_name"`
+	}
+	if json.Unmarshal(resp.Info.Video, &obj) == nil && obj.CodecName != "" {
+		return strings.ToLower(obj.CodecName)
+	}
+	var arr []struct {
+		CodecName string `json:"codec_name"`
+	}
+	if json.Unmarshal(resp.Info.Video, &arr) == nil && len(arr) > 0 {
+		return strings.ToLower(arr[0].CodecName)
+	}
+	return ""
+}
+
+// nextScanAt retourne la durée jusqu'à la prochaine 3h00 locale.
+func nextScanAt() time.Duration {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	return time.Until(next)
+}
+
+func codecScanner() {
+	<-credsReady
+	wait := nextScanAt()
+	log.Printf("Codec scanner: premier scan dans %.1fh (à 3h00)", wait.Hours())
+	time.Sleep(wait)
+	for {
+		// Récupère uniquement les streams VOD filtrés (catégories FR/MULTI/…)
+		catsURL := fmt.Sprintf("%s/player_api.php?username=%s&password=%s&action=get_vod_categories",
+			upstream, epgUser, epgPass)
+		streamsURL := fmt.Sprintf("%s/player_api.php?username=%s&password=%s&action=get_vod_streams",
+			upstream, epgUser, epgPass)
+		catsData, err := fetchJSON(catsURL)
+		if err != nil {
+			log.Printf("Codec scanner: fetch categories error: %v", err)
+			time.Sleep(10 * time.Minute)
+			continue
+		}
+		streamsData, err := fetchJSON(streamsURL)
+		if err != nil {
+			log.Printf("Codec scanner: fetch streams error: %v", err)
+			time.Sleep(10 * time.Minute)
+			continue
+		}
+		filtered := filterStreams(streamsData, keptIDs(catsData, keepVod))
+		var streams []map[string]interface{}
+		json.Unmarshal(filtered, &streams)
+
+		// Identifie les stream_id sans entrée dans le cache
+		var todo []string
+		codecDB.RLock()
+		for _, s := range streams {
+			sid := fmt.Sprintf("%v", s["stream_id"])
+			if _, known := codecDB.data[sid]; !known {
+				todo = append(todo, sid)
+			}
+		}
+		codecDB.RUnlock()
+		log.Printf("Codec scanner: %d streams à analyser sur %d total", len(todo), len(streams))
+
+		newEntries := 0
+		for i, sid := range todo {
+			infoURL := fmt.Sprintf("%s/player_api.php?username=%s&password=%s&action=get_vod_info&vod_id=%s",
+				upstream, epgUser, epgPass, sid)
+			raw, err := fetchJSON(infoURL)
+			codec := ""
+			if err == nil {
+				codec = extractCodec(raw)
+			}
+			if codec == "" {
+				codec = "unknown"
+			}
+			codecDB.Lock()
+			codecDB.data[sid] = codec
+			codecDB.Unlock()
+			newEntries++
+			if newEntries%codecSavePeriod == 0 {
+				saveCodecCache()
+				log.Printf("Codec scanner: %d/%d traités", i+1, len(todo))
+			}
+			time.Sleep(codecScanDelay)
+		}
+		if newEntries > 0 {
+			saveCodecCache()
+		}
+		log.Printf("Codec scanner: scan terminé — %d nouvelles entrées", newEntries)
+		// Prochain scan : 3h00 dans 7 jours
+		time.Sleep(6*24*time.Hour + nextScanAt())
+	}
+}
 
 // ── EPG cache ─────────────────────────────────────────────────────────────────
 
@@ -690,7 +851,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 502)
 			return
 		}
-		w.Write(cleanVodNames(filterStreams(d, keptIDs(cats, keepVod))))
+		w.Write(cleanVodNames(filterHevc(filterStreams(d, keptIDs(cats, keepVod)))))
 
 	case "get_series_categories":
 		d, err := cachedJSON(upURL)
@@ -763,8 +924,10 @@ func main() {
 	log.Printf("xtream-proxy starting on :%s", listenPort)
 
 	loadCredsFromDisk()
+	loadCodecCache()
 	loadEPGFromDisk()
 	go epgFetcher()
+	go codecScanner()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/player_api.php", handleAPI)
