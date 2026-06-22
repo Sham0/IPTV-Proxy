@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -135,13 +136,18 @@ func keepLive(name string) bool {
 		strings.HasPrefix(name, "CDM|")
 }
 
-// cleanVodName strips provider prefixes ("FR - ", "MULTI - ", etc.) and trailing
-// year suffixes already embedded in the name so TMDB gets a clean title to match.
+var reYear = regexp.MustCompile(`\s*\(\d{4}\)\s*$`)
+
+// cleanVodName strips provider prefixes ("FR - ", "MULTI - ", etc.) and the
+// trailing "(YYYY)" so TMDB gets a bare title to match against. Stripping the
+// year is required because source_select uses a substring check: "Garlitsky"
+// in "daniel garlitsky" scores 80, whereas "Garlitsky (2025)" does not match.
 func cleanVodName(name string) string {
 	if i := strings.Index(name, " - "); i >= 0 && i <= 8 {
 		name = strings.TrimSpace(name[i+3:])
 	}
-	return name
+	name = reYear.ReplaceAllString(name, "")
+	return strings.TrimSpace(name)
 }
 
 func cleanVodNames(data json.RawMessage) json.RawMessage {
