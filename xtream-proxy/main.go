@@ -131,7 +131,8 @@ func loadEPGFromDisk() {
 // ── Filtrage catégories / streams ─────────────────────────────────────────────
 
 func keepLive(name string) bool {
-	return strings.HasPrefix(name, "FR|")
+	return strings.HasPrefix(name, "FR|") ||
+		strings.HasPrefix(name, "CDM|")
 }
 
 func keepVod(name string) bool {
