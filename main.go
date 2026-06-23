@@ -76,6 +76,11 @@ func (db *codecDB) load() {
 	}
 	var m map[string]string
 	if json.Unmarshal(f, &m) == nil {
+		for k, v := range m {
+			if v == "unknown" {
+				delete(m, k)
+			}
+		}
 		db.mu.Lock()
 		db.data = m
 		db.mu.Unlock()
@@ -211,6 +216,7 @@ func (e *epgStore) refresh(u, p string) {
 // --- HTTP clients ---
 
 var apiClient = &http.Client{Timeout: 30 * time.Second}
+var probeClient = &http.Client{Timeout: 10 * time.Second}
 var streamClient = &http.Client{Timeout: 0}
 
 // --- Filters ---
@@ -308,6 +314,40 @@ func filterSeries(series []map[string]interface{}) []map[string]interface{} {
 	return out
 }
 
+// --- Codec probe ---
+
+var ebmlCodecs = []struct {
+	pattern []byte
+	name    string
+}{
+	{[]byte("V_MPEGH/ISO/HEVC"), "hevc"},
+	{[]byte("V_MPEG4/ISO/AVC"), "h264"},
+	{[]byte("V_VP9"), "vp9"},
+	{[]byte("V_AV1"), "av1"},
+}
+
+func probeStreamCodec(streamID string) string {
+	u, p := globalCreds.get()
+	url := fmt.Sprintf("%s/movie/%s/%s/%s.mkv", upstream, u, p, streamID)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Range", "bytes=0-8191")
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	for _, c := range ebmlCodecs {
+		if bytes.Contains(data, c.pattern) {
+			return c.name
+		}
+	}
+	return ""
+}
+
 // --- Codec scanner ---
 
 func nextScanAt() time.Time {
@@ -337,46 +377,45 @@ func codecScanner() {
 			json.NewDecoder(resp.Body).Decode(&all)
 			resp.Body.Close()
 
-			filtered := filterVod(all)
-			n := len(filtered)
-			log.Printf("Codec scanner: %d streams à scanner", n)
-
-			saved := 0
-			for i, s := range filtered {
+			// Collect MKV streams not yet in cache — only those need probing
+			var toProbe []string
+			for _, s := range all {
+				name, _ := s["name"].(string)
+				if !isVodStream(name) {
+					continue
+				}
+				ext, _ := s["container_extension"].(string)
+				if ext != "mkv" {
+					continue
+				}
 				id, _ := s["stream_id"].(json.Number)
 				idStr := id.String()
 				if codec.get(idStr) != "" {
 					continue
 				}
+				toProbe = append(toProbe, idStr)
+			}
 
-				// Sequential fetch — no goroutines to limit memory and CPU
-				infoResp, err := apiClient.Get(fmt.Sprintf(
-					"%s/player_api.php?username=%s&password=%s&action=get_vod_info&vod_id=%s",
-					upstream, u, p, idStr,
-				))
-				if err == nil {
-					var info map[string]interface{}
-					if json.NewDecoder(infoResp.Body).Decode(&info) == nil {
-						if mi, ok := info["info"].(map[string]interface{}); ok {
-							if c, ok := mi["video_codec"].(string); ok && c != "" {
-								codec.set(idStr, strings.ToLower(c))
-								saved++
-							}
-						}
-					}
-					infoResp.Body.Close()
+			n := len(toProbe)
+			log.Printf("Codec scanner: %d streams MKV à sonder", n)
+
+			saved := 0
+			for i, idStr := range toProbe {
+				if c := probeStreamCodec(idStr); c != "" {
+					codec.set(idStr, c)
+					saved++
 				}
 
 				if (i+1)%scanCheckpointN == 0 {
 					codec.save()
-					log.Printf("Codec scanner: %d/%d scannés, %d nouveaux", i+1, n, saved)
+					log.Printf("Codec scanner: %d/%d sondés, %d codecs trouvés", i+1, n, saved)
 				}
 
 				time.Sleep(codecScanDelay)
 			}
 
 			codec.save()
-			log.Printf("Codec scanner: scan terminé — %d streams, %d nouveaux codecs", n, saved)
+			log.Printf("Codec scanner: scan terminé — %d sondés, %d codecs trouvés", n, saved)
 		}
 
 		// Next scan: 6 days from now, at 3h00
@@ -584,3 +623,4 @@ func main() {
 
 	log.Fatal(http.ListenAndServe(":"+proxyPort, mux))
 }
+
