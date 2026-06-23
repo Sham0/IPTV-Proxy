@@ -241,12 +241,10 @@ func isLiveStream(name string) bool {
 }
 
 func isVodStream(name string) bool {
-	upper := strings.ToUpper(name)
-	if strings.Contains(upper, "4K") || strings.Contains(upper, "|QC") {
+	if strings.Contains(name, "4K") || strings.HasPrefix(name, "QFR") {
 		return false
 	}
-	return strings.Contains(upper, "|FR|") || strings.Contains(upper, "|MULTI|") ||
-		strings.Contains(upper, "NETFLIX") || strings.Contains(upper, "APPLE")
+	return strings.HasPrefix(name, "FR ") || strings.HasPrefix(name, "NF ")
 }
 
 var hevcCodecs = []string{"hevc", "h265", "av1", "vp9"}
