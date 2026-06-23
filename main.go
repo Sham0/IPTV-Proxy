@@ -265,6 +265,48 @@ func isHevc(c string) bool {
 	return false
 }
 
+// hevcNameKeywords are stream name patterns that reliably indicate HEVC.
+// "4K" is already excluded by isVodStream — these cover the rest.
+var hevcNameKeywords = []string{"UHD", "HEVC", "X265", "H265", "2160"}
+
+func isLikelyHevcByName(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, kw := range hevcNameKeywords {
+		if strings.Contains(upper, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// hevcCatKeywords are patterns in category names that mark all streams as HEVC.
+var hevcCatKeywords = []string{"UHD", "4K", "HEVC", "8K", "2160", "3840"}
+
+func buildHevcCategorySet(u, p string) map[string]bool {
+	resp, err := apiClient.Get(fmt.Sprintf(
+		"%s/player_api.php?username=%s&password=%s&action=get_vod_categories", upstream, u, p,
+	))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var cats []map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&cats)
+
+	set := make(map[string]bool)
+	for _, cat := range cats {
+		name := strings.ToUpper(fmt.Sprintf("%v", cat["category_name"]))
+		for _, kw := range hevcCatKeywords {
+			if strings.Contains(name, kw) {
+				set[fmt.Sprintf("%v", cat["category_id"])] = true
+				break
+			}
+		}
+	}
+	log.Printf("Codec scanner: %d catégories HEVC identifiées", len(set))
+	return set
+}
+
 func filterLive(streams []map[string]interface{}) []map[string]interface{} {
 	var out []map[string]interface{}
 	for _, s := range streams {
@@ -377,8 +419,14 @@ func codecScanner() {
 			json.NewDecoder(resp.Body).Decode(&all)
 			resp.Body.Close()
 
-			// Collect MKV streams not yet in cache — only those need probing
-			var toProbe []string
+			hevcCats := buildHevcCategorySet(u, p)
+
+			// Classify MKV streams: name/category shortcuts first, probe the rest
+			type mkvEntry struct {
+				id    string
+				probe bool // true = needs range probe
+			}
+			var entries []mkvEntry
 			for _, s := range all {
 				name, _ := s["name"].(string)
 				if !isVodStream(name) {
@@ -393,29 +441,48 @@ func codecScanner() {
 				if codec.get(idStr) != "" {
 					continue
 				}
-				toProbe = append(toProbe, idStr)
+				catID := fmt.Sprintf("%v", s["category_id"])
+				if hevcCats[catID] || isLikelyHevcByName(name) {
+					entries = append(entries, mkvEntry{idStr, false})
+				} else {
+					entries = append(entries, mkvEntry{idStr, true})
+				}
 			}
 
-			n := len(toProbe)
-			log.Printf("Codec scanner: %d streams MKV à sonder", n)
+			shortcuts := 0
+			for _, e := range entries {
+				if !e.probe {
+					shortcuts++
+				}
+			}
+			log.Printf("Codec scanner: %d MKV total — %d raccourcis HEVC, %d à sonder",
+				len(entries), shortcuts, len(entries)-shortcuts)
 
 			saved := 0
-			for i, idStr := range toProbe {
-				if c := probeStreamCodec(idStr); c != "" {
-					codec.set(idStr, c)
+			probed := 0
+			for i, e := range entries {
+				if !e.probe {
+					codec.set(e.id, "hevc")
 					saved++
+				} else {
+					if c := probeStreamCodec(e.id); c != "" {
+						codec.set(e.id, c)
+						saved++
+					}
+					probed++
+					time.Sleep(codecScanDelay)
 				}
 
 				if (i+1)%scanCheckpointN == 0 {
 					codec.save()
-					log.Printf("Codec scanner: %d/%d sondés, %d codecs trouvés", i+1, n, saved)
+					log.Printf("Codec scanner: %d/%d traités, %d codecs enregistrés",
+						i+1, len(entries), saved)
 				}
-
-				time.Sleep(codecScanDelay)
 			}
 
 			codec.save()
-			log.Printf("Codec scanner: scan terminé — %d sondés, %d codecs trouvés", n, saved)
+			log.Printf("Codec scanner: terminé — %d raccourcis + %d sondés, %d enregistrés",
+				shortcuts, probed, saved)
 		}
 
 		// Next scan: 6 days from now, at 3h00
