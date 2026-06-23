@@ -484,7 +484,7 @@ func handleEPG(w http.ResponseWriter, r *http.Request) {
 
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	target := upstream + r.URL.RequestURI()
-	req, err := http.NewRequest(r.Method, target, r.Body)
+	req, err := http.NewRequest(r.Method, target, nil)
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
@@ -499,14 +499,42 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
-	defer resp.Body.Close()
+
+	// Track byte offset for reconnect (honoring initial Range seek if any)
+	var offset int64
+	if rng := r.Header.Get("Range"); rng != "" {
+		fmt.Sscanf(strings.TrimPrefix(rng, "bytes="), "%d-", &offset)
+	}
+
+	// Forward headers — strip Content-Length so Kodi handles upstream drops as EOF
 	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	// Stream with automatic upstream reconnect on mid-stream drop (max 5 retries)
+	for attempt := 0; attempt < 5; attempt++ {
+		n, copyErr := io.Copy(w, resp.Body)
+		resp.Body.Close()
+		offset += n
+		if copyErr == nil || n == 0 {
+			return
+		}
+		log.Printf("Stream: upstream drop at %d bytes, reconnect %d/5", offset, attempt+1)
+		retryReq, _ := http.NewRequest("GET", target, nil)
+		retryReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		resp, err = streamClient.Do(retryReq)
+		if err != nil {
+			log.Printf("Stream: reconnect failed: %v", err)
+			return
+		}
+	}
+	resp.Body.Close()
 }
 
 func main() {
