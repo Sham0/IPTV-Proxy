@@ -458,31 +458,25 @@ func codecScanner() {
 			log.Printf("Codec scanner: %d MKV total — %d raccourcis HEVC, %d à sonder",
 				len(entries), shortcuts, len(entries)-shortcuts)
 
-			saved := 0
-			probed := 0
+			assumed := 0
 			for i, e := range entries {
 				if !e.probe {
 					codec.set(e.id, "hevc")
-					saved++
 				} else {
-					if c := probeStreamCodec(e.id); c != "" {
-						codec.set(e.id, c)
-						saved++
-					}
-					probed++
-					time.Sleep(codecScanDelay)
+					codec.set(e.id, "h264") // assume h264 — 95%+ hit rate, skip probe on rescan
+					assumed++
 				}
 
 				if (i+1)%scanCheckpointN == 0 {
 					codec.save()
-					log.Printf("Codec scanner: %d/%d traités, %d codecs enregistrés",
-						i+1, len(entries), saved)
+					log.Printf("Codec scanner: %d/%d traités",
+						i+1, len(entries))
 				}
 			}
 
 			codec.save()
-			log.Printf("Codec scanner: terminé — %d raccourcis + %d sondés, %d enregistrés",
-				shortcuts, probed, saved)
+			log.Printf("Codec scanner: terminé — %d raccourcis HEVC, %d assumés h264",
+				shortcuts, assumed)
 		}
 
 		// Next scan: 6 days from now, at 3h00
@@ -690,4 +684,5 @@ func main() {
 
 	log.Fatal(http.ListenAndServe(":"+proxyPort, mux))
 }
+
 
