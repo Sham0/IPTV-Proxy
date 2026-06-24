@@ -339,6 +339,26 @@ func filterVod(streams []map[string]interface{}) []map[string]interface{} {
 	return out
 }
 
+var excludedCatKeywords = []string{"4K", "3D", "UHD", "HEVC", "8K", "2160", "3840"}
+
+func filterVodCategories(cats []map[string]interface{}) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, c := range cats {
+		name := strings.ToUpper(fmt.Sprintf("%v", c["category_name"]))
+		excluded := false
+		for _, kw := range excludedCatKeywords {
+			if strings.Contains(name, kw) {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func filterSeries(series []map[string]interface{}) []map[string]interface{} {
 	var out []map[string]interface{}
 	for _, s := range series {
@@ -553,6 +573,8 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		fetchAndFilter("get_vod_streams", filterVod)
 	case "get_series":
 		fetchAndFilter("get_series", filterSeries)
+	case "get_vod_categories":
+		fetchAndFilter("get_vod_categories", filterVodCategories)
 	default:
 		resp, err := apiClient.Get(buildURL(action))
 		if err != nil {
@@ -684,5 +706,6 @@ func main() {
 
 	log.Fatal(http.ListenAndServe(":"+proxyPort, mux))
 }
+
 
 
